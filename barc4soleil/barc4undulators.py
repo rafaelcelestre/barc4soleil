@@ -10,13 +10,33 @@ __contact__ = 'rafael.celestre@synchrotron-soleil.fr'
 __license__ = 'GPL-3.0'
 __copyright__ = 'Synchrotron SOLEIL, Saint Aubin, France'
 __created__ = '12/MAR/2024'
-__changed__ = '12/MAR/2024'
+__changed__ = '15/MAR/2024'
 
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from scipy.constants import physical_constants
 from scipy.optimize import curve_fit
+from scipy.signal import find_peaks
+
+USE_SRWLIB = False
+try:
+    import srwpy.srwlib as srwlib
+    USE_SRWLIB = True
+    print('SRW distribution of SRW')
+except:
+    import oasys_srw.srwlib as srwlib
+    USE_SRWLIB = True
+    print('OASYS distribution of SRW')
+if USE_SRWLIB is False:
+    print("SRW is not available")
+
+PLANCK = physical_constants["Planck constant"][0]
+LIGHT = physical_constants["speed of light in vacuum"][0]
+CHARGE = physical_constants["atomic unit of charge"][0]
+MASS = physical_constants["electron mass"][0]
+PI = np.pi
+RMS = np.sqrt(2)/2
 
 #***********************************************************************************
 # auxiliary functions
@@ -54,10 +74,7 @@ def energy_wavelength(value: float, unity: str) -> float:
     else:
         raise ValueError("Invalid unit provided: {}".format(unity))
 
-    return physical_constants["Planck constant"][0] * \
-           physical_constants["speed of light in vacuum"][0] / \
-           physical_constants["atomic unit of charge"][0] / \
-           (value * factor)
+    return PLANCK * LIGHT / CHARGE / (value * factor)
 
 
 def get_gamma(E: float) -> float:
@@ -70,39 +87,191 @@ def get_gamma(E: float) -> float:
     Returns:
         float: Lorentz factor (γ).
     """
-    return E * 1e9 / (physical_constants["electron mass"][0] * physical_constants["speed of light in vacuum"][0] ** 2) * physical_constants["atomic unit of charge"][0]
+    return E * 1e9 / (MASS * LIGHT ** 2) * CHARGE
 
 #***********************************************************************************
-# undulator parameters
+# read/write functions for magnetic fields
 #***********************************************************************************
 
-def get_K_from_B(B: float, period: float) -> float:
+def read_magnetic_measurement(file_path: str) -> np.ndarray:
     """
-    Calculate the undulator parameter K from the magnetic field B and the undulator period lambda_u.
+    Read magnetic measurement data from a file.
+
+    Parameters:
+        file_path (str): The path to the file containing magnetic measurement data.
+
+    Returns:
+        np.ndarray: A NumPy array containing the magnetic measurement data.
+    """
+
+    data = []
+
+    with open(file_path, 'r') as file:
+        for line in file:
+            if not line.startswith('#'):
+                values = line.split( )
+                data.append([float(value) for value in values])
+                
+    return np.asarray(data)
+
+
+def read_magnetic_measurement_srw():
+    pass
+
+
+def write_magnetic_measurement():
+    pass
+
+
+def generate_magnetic_measurement():
+    pass
+
+
+def generate_magnetic_field_3D(mag_field_array: np.ndarray, file_path: Optional[str] = None) -> srwlib.SRWLMagFld3D:
+    """
+    Generate a 3D magnetic field object based on the input magnetic field array.
+
+    Parameters:
+        mag_field_array (np.ndarray): Array containing magnetic field data. Each row corresponds to a point in the 3D space,
+                                      where the first column represents the position along the longitudinal axis, and subsequent 
+                                      columns represent magnetic field components (e.g., Bx, By, Bz).
+        file_path (str, optional): File path to save the generated magnetic field object. If None, the object won't be saved.
+
+    Returns:
+        SRWLMagFld3D: Generated 3D magnetic field object.
+
+    """
+    nfield, ncomponents = mag_field_array.shape
+
+    field_axis = (mag_field_array[:, 0] - np.mean(mag_field_array[:, 0])) * 1e-3
+
+    Bx = mag_field_array[:, 1]
+    if ncomponents > 2:
+        By = mag_field_array[:, 2]
+    else:
+        By = np.zeros(nfield)
+    if ncomponents > 3:
+        Bz = mag_field_array[:, 3]
+    else:
+        Bz = np.zeros(nfield)
+
+    magFldCnt = srwlib.SRWLMagFld3D(Bx, By, Bz, 1, 1, nfield - 1, 0, 0, field_axis[-1]-field_axis[0], 1)
+
+    if file_path is not None:
+        print(f">>> saving {file_path}")
+        magFldCnt.save_ascii(file_path)
+
+    return magFldCnt
+
+
+#***********************************************************************************
+# magnetic field properties
+#***********************************************************************************
+
+def get_magnetic_field_properties(mag_field_component: np.ndarray, 
+                                  field_axis: np.ndarray, 
+                                  threshold: float = 0.7,
+                                  **kwargs: Any) -> Dict[str, Any]:
+    """
+    Perform analysis on magnetic field data.
+
+    Parameters:
+        mag_field_component (np.ndarray): Array containing magnetic field component data.
+        field_axis (np.ndarray): Array containing axis data corresponding to the magnetic field component.
+        threshold (float, optional): Peak detection threshold as a fraction of the maximum value.
+        **kwargs: Additional keyword arguments.
+            - pad (bool): Whether to pad the magnetic field component array for FFT analysis. Default is False.
+            - positive_side (bool): Whether to consider only the positive side of the FFT. Default is True.
+
+    Returns:
+        Dict[str, Any]: Dictionary containing magnetic field properties including mean, standard deviation,
+                        undulator period mean, undulator period standard deviation, frequency, and FFT data.
+    """
+
+    peaks, _ = find_peaks(mag_field_component, height=np.amax(mag_field_component) *threshold)
+
+    # Calculate distances between consecutive peaks
+    periods = np.diff(field_axis[peaks])
+    average_period = np.mean(periods)
+    period_dispersion = np.std(periods)
+    average_peak = np.mean(mag_field_component[peaks])
+    peak_dispersion = np.std(mag_field_component[peaks])
+
+    print(f"Number of periods: {len(periods)}")
+    print(f"Average period: {average_period * 1e3:.3f}+-{period_dispersion * 1e3:.3f} [mm]")
+    print(f"Average peak: {average_peak:.3f}+-{peak_dispersion:.3f} [T]")
+
+    mag_field_properties = {
+        "field": mag_field_component,
+        "axis": field_axis,
+        "mag_field_mean": average_peak,
+        "mag_field_std": peak_dispersion,
+        "und_period_mean": average_period,
+        "und_period_std": period_dispersion,
+    }
+    # # RC20240315: debug
+    # import matplotlib.pyplot as plt
+    # plt.plot(mag_field_component)
+    # plt.plot(peaks, mag_field_component[peaks], "x")
+    # plt.plot(np.zeros_like(mag_field_component), "--", color="gray")
+    # plt.show()
+
+    # Frequency analysis of the magnetic field
+    pad = kwargs.get("pad", False)
+    positive_side = kwargs.get("positive_side", True)
+
+    if pad:
+        mag_field_component = np.pad(mag_field_component, 
+                                     (int(len(mag_field_component) / 2), 
+                                      int(len(mag_field_component) / 2)))
+    
+    naxis = len(mag_field_component)
+    daxis = field_axis[1] - field_axis[0]
+
+    fftfield = np.abs(np.fft.fftshift(np.fft.fft(mag_field_component)))
+    freq = np.fft.fftshift(np.fft.fftfreq(naxis, daxis))
+
+    if positive_side:
+        fftfield = 2 * fftfield[freq > 0]
+        freq = freq[freq > 0]
+
+    mag_field_properties["freq"] = freq
+    mag_field_properties["fft"] = fftfield
+
+    return mag_field_properties
+
+
+#***********************************************************************************
+# undulator auxiliary functions
+#***********************************************************************************
+
+def get_K_from_B(B: float, und_per: float) -> float:
+    """
+    Calculate the undulator parameter K from the magnetic field B and the undulator period.
 
     Parameters:
     B (float): Magnetic field in Tesla.
-    period (float): Undulator period in meters.
+    und_per (float): Undulator period in meters.
 
     Returns:
     float: The undulator parameter K.
     """
-    K = physical_constants["atomic unit of charge"][0] * B * period / (2 * np.pi * physical_constants["electron mass"][0] * physical_constants["speed of light in vacuum"][0])
+    K = CHARGE * B * und_per / (2 * PI * MASS * LIGHT)
     return K
 
 
-def get_B_from_K(K: float, period: float) -> float:
+def get_B_from_K(K: float, und_per: float) -> float:
     """
-    Calculate the undulator magnetic field in Tesla from the undulator parameter K and the undulator period lambda_u.
+    Calculate the undulator magnetic field in Tesla from the undulator parameter K and the undulator period.
 
     Parameters:
     K (float): The undulator parameter K.
-    period (float): Undulator period in meters.
+    und_per (float): Undulator period in meters.
 
     Returns:
     float: Magnetic field in Tesla.
     """
-    B = K * 2 * np.pi * physical_constants["electron mass"][0] * physical_constants["speed of light in vacuum"][0]/(physical_constants["atomic unit of charge"][0] * period)
+    B = K * 2 * PI * MASS * LIGHT/(CHARGE * und_per)
     return B
 
 #***********************************************************************************
@@ -110,16 +279,16 @@ def get_B_from_K(K: float, period: float) -> float:
 #***********************************************************************************
 
 def fit_gap_field_relation(gap_table: List[float], B_table: List[float], 
-                           u_period: float) -> Tuple[float, float, float]:
+                           und_per: float) -> Tuple[float, float, float]:
     """
     Fit parameters coeff0, coeff1, and coeff2 for an undulator from the given tables:
 
-    B0 = c0 * exp[c1(gap/u_period) + c2(gap/u_period)]
+    B0 = c0 * exp[c1(gap/und_per) + c2(gap/und_per)**2]
 
     Parameters:
         gap_table (List[float]): List of gap sizes in meters.
         B_table (List[float]): List of magnetic field values in Tesla corresponding to the gap sizes.
-        u_period (float): Undulator period in meters.
+        und_per (float): Undulator period in meters.
 
     Returns:
         Tuple[float, float, float]: Fitted parameters (coeff0, coeff1, coeff2).
@@ -127,12 +296,12 @@ def fit_gap_field_relation(gap_table: List[float], B_table: List[float],
     def _model(gp, c0, c1, c2):
         return c0 * np.exp(c1*gp + c2*gp**2)
 
-    def _fit_parameters(gap, u_period, B):
-        gp = gap / u_period
+    def _fit_parameters(gap, und_per, B):
+        gp = gap / und_per
         popt, pcov = curve_fit(_model, gp, B, p0=(1, 1, 1)) 
         return popt
 
-    popt = _fit_parameters(np.asarray(gap_table), u_period, np.asarray(B_table))
+    popt = _fit_parameters(np.asarray(gap_table), und_per, np.asarray(B_table))
     coeff0_fit, coeff1_fit, coeff2_fit = popt
 
     print("Fitted parameters:")
@@ -143,39 +312,42 @@ def fit_gap_field_relation(gap_table: List[float], B_table: List[float],
     return coeff0_fit, coeff1_fit, coeff2_fit
 
 
-def get_B_from_gap(gap: float, u_period: float, coeff0: float, coeff1: float, 
-                   coeff2: float) -> Union[float, None]:
+def get_B_from_gap(gap: Union[float, np.ndarray], und_per: float, coeff: Tuple[float, float, float]) -> Union[float, np.ndarray, None]:
     """
     Calculate the magnetic field B from the given parameters:
-       B0 = c0 * exp[c1(gap/u_period) + c2(gap/u_period)]
+       B0 = c0 * exp[c1(gap/und_per) + c2(gap/und_per)**2]
 
     Parameters:
-        gap (float): Gap size in meters.
-        u_period (float): Undulator period in meters.
-        coeff0 (float): Coefficient 0.
-        coeff1 (float): Coefficient 1.
-        coeff2 (float): Coefficient 2.
+        gap (Union[float, np.ndarray]): Gap size(s) in meters.
+        und_per (float): Undulator period in meters.
+        coeff (Tuple[float, float, float]): Fit coefficients.
 
     Returns:
-        float: Calculated magnetic field B.
-        None: If gap or period is non-positive, returns None.
+        Union[float, np.ndarray, None]: Calculated magnetic field B if gap and period are positive, otherwise None.
     """
+    if isinstance(gap, np.ndarray):
+        if np.any(gap <= 0) or und_per <= 0:
+            return None
+        gp = gap / und_per
+    else:
+        if gap <= 0 or und_per <= 0:
+            return None
+        gp = gap / und_per
 
-    gp = np.asarray(gap) / u_period
-    B = coeff0 * np.exp(coeff1 * gp + coeff2 * gp**2)
-    
+    B = coeff[0] * np.exp(coeff[1] * gp + coeff[2] * gp**2)
     return B
+
 
 #***********************************************************************************
 # undulator emission
 #***********************************************************************************
 
-def get_emission_energy(u_period: float, K: float, ring_e: float, n: int = 1, theta: float = 0) -> float:
+def get_emission_energy(und_per: float, K: float, ring_e: float, n: int = 1, theta: float = 0) -> float:
     """
     Calculate the energy of an undulator emission in a storage ring.
 
     Parameters:
-        u_period (float): Undulator period in meters.
+        und_per (float): Undulator period in meters.
         K (float): Undulator parameter.
         ring_e (float): Energy of electrons in GeV.
         n (int, optional): Harmonic number (default is 1).
@@ -185,7 +357,7 @@ def get_emission_energy(u_period: float, K: float, ring_e: float, n: int = 1, th
         float: Emission energy in electron volts.
     """
     gamma = get_gamma(ring_e)
-    emission_wavelength = u_period * (1 + (K ** 2) / 2 + (gamma * theta) ** 2) / (2 * n * gamma ** 2)
+    emission_wavelength = und_per * (1 + (K ** 2) / 2 + (gamma * theta) ** 2) / (2 * n * gamma ** 2)
 
     return energy_wavelength(emission_wavelength, "m")
 
